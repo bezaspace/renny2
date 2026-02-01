@@ -1,5 +1,7 @@
 import json
+import os
 import random
+import urllib.parse
 from io import StringIO
 from typing import Any, Callable, Dict, List, Optional
 
@@ -21,6 +23,8 @@ from google.adk.tools import ToolContext
 from google.adk.utils.context_utils import Aclosing
 from google.adk.utils.instructions_utils import inject_session_state
 from google.genai import types
+from mcp import ClientSession, types as mcp_types
+from mcp.client.streamable_http import streamablehttp_client
 
 # --- Defaults aligned to inspiration.md ---
 PERIODS = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
@@ -64,6 +68,13 @@ DEFAULT_EXIT_PROB = 0.1
 DEFAULT_STATS_OPTIONS = ["incl_open"]
 DEFAULT_SUBPLOTS = ["orders", "trade_pnl", "cum_returns"]
 DEFAULT_METRIC = "Total Return [%]"
+
+EXA_DEFAULT_TOOLS = [
+    "web_search_exa",
+    "company_research_exa",
+    "deep_search_exa",
+    "crawling_exa",
+]
 
 # --- Plot styling ---
 COLOR_SCHEMA = settings["plotting"]["color_schema"]
@@ -113,6 +124,42 @@ def _conflict_from_name(name: str) -> DirectionConflictMode:
 def _set_end_invocation(tool_context: ToolContext) -> None:
     # Use internal access to end the current invocation after a tool result.
     tool_context._invocation_context.end_invocation = True
+
+
+def _exa_mcp_url() -> str:
+    base_url = os.getenv("EXA_MCP_URL", "https://mcp.exa.ai/mcp").strip()
+    tools_csv = os.getenv("EXA_MCP_TOOLS", ",".join(EXA_DEFAULT_TOOLS)).strip()
+    if not tools_csv:
+        return base_url
+    url = urllib.parse.urlsplit(base_url)
+    query = urllib.parse.parse_qs(url.query)
+    query.setdefault("tools", [tools_csv])
+    new_query = urllib.parse.urlencode(query, doseq=True)
+    return urllib.parse.urlunsplit((url.scheme, url.netloc, url.path, new_query, url.fragment))
+
+
+def _exa_allowed_tools() -> List[str]:
+    tools_csv = os.getenv("EXA_MCP_TOOLS", ",".join(EXA_DEFAULT_TOOLS)).strip()
+    if not tools_csv:
+        return EXA_DEFAULT_TOOLS
+    return [tool.strip() for tool in tools_csv.split(",") if tool.strip()]
+
+
+def _exa_result_summary(result: mcp_types.CallToolResult) -> str:
+    text_chunks: List[str] = []
+    for content in result.content:
+        if isinstance(content, mcp_types.TextContent):
+            text = (content.text or "").strip()
+            if text:
+                text_chunks.append(text)
+    if text_chunks:
+        return "\n\n".join(text_chunks)
+    if result.structuredContent is not None:
+        try:
+            return json.dumps(result.structuredContent, ensure_ascii=True, indent=2)
+        except TypeError:
+            return str(result.structuredContent)
+    return "Exa MCP tool completed."
 
 
 def _default_candle_settings() -> pd.DataFrame:
@@ -167,6 +214,48 @@ def _apply_candle_settings(settings_rows: List[Dict[str, Any]]) -> None:
 
 
 # --- Tools ---
+
+async def exa_mcp_research(
+    tool_name: str,
+    arguments: Optional[Dict[str, Any]] = None,
+    tool_context: ToolContext = None,
+) -> Dict[str, Any]:
+    """Call Exa MCP tools for web research (auto-call allowed)."""
+    allowed_tools = set(_exa_allowed_tools())
+    if tool_name not in allowed_tools:
+        raise ValueError(
+            f"Unsupported Exa tool '{tool_name}'. Allowed: {', '.join(sorted(allowed_tools))}."
+        )
+
+    url = _exa_mcp_url()
+    payload = arguments or {}
+
+    async with streamablehttp_client(url) as (read_stream, write_stream, _):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.call_tool(tool_name, payload)
+
+    summary = _exa_result_summary(result)
+    structured_payload = None
+    if result.structuredContent is not None:
+        try:
+            structured_payload = json.loads(
+                json.dumps(result.structuredContent, ensure_ascii=True)
+            )
+        except TypeError:
+            structured_payload = str(result.structuredContent)
+    tool_context.actions.skip_summarization = True
+    _set_end_invocation(tool_context)
+    return {
+        "step": "exa_research",
+        "summary": summary,
+        "artifacts": [],
+        "data": {
+            "tool_name": tool_name,
+            "arguments": payload,
+            "structured": structured_payload,
+        },
+    }
 
 async def reset_pipeline(tool_context: ToolContext) -> Dict[str, Any]:
     """Reset all stored pipeline state to start over."""
@@ -825,7 +914,11 @@ COMMON_RULES = (
     "Provide concise, practical explanations, clarify assumptions, and ask brief follow-up questions when details are missing. "
     "Do not provide personalized financial advice. "
     "Always include a short disclaimer that responses are informational only. "
-    "At each step, ask for explicit confirmation before calling a tool. "
+    "At each step, ask for explicit confirmation before calling a tool, "
+    "except you may auto-call exa_mcp_research when the user explicitly asks for research. "
+    "For exa_mcp_research, set tool_name to one of: "
+    + ", ".join(EXA_DEFAULT_TOOLS)
+    + ". "
     "If the user is unsure, propose defaults, explain briefly, and ask to confirm. "
     "If the user says 'you decide', choose sensible defaults and ask to confirm."
 )
@@ -890,28 +983,28 @@ def build_agent_pipeline(model) -> BaseAgent:
         model=model,
         description="Collects data parameters and fetches OHLCV.",
         instruction=_data_instruction,
-        tools=[fetch_ohlcv, reset_pipeline],
+        tools=[fetch_ohlcv, reset_pipeline, exa_mcp_research],
     )
     signals_agent = LlmAgent(
         name="signals_agent",
         model=model,
         description="Collects signal parameters and generates pattern signals.",
         instruction=_signals_instruction,
-        tools=[build_signals, reset_pipeline],
+        tools=[build_signals, reset_pipeline, exa_mcp_research],
     )
     backtest_agent = LlmAgent(
         name="backtest_agent",
         model=model,
         description="Collects backtest parameters and runs the simulation.",
         instruction=_backtest_instruction,
-        tools=[run_backtest, reset_pipeline],
+        tools=[run_backtest, reset_pipeline, exa_mcp_research],
     )
     metric_agent = LlmAgent(
         name="metric_agent",
         model=model,
         description="Collects metric choice and renders distribution.",
         instruction=_metric_instruction,
-        tools=[metric_distribution, reset_pipeline],
+        tools=[metric_distribution, reset_pipeline, exa_mcp_research],
     )
 
     def should_run_data(ctx: InvocationContext) -> bool:
